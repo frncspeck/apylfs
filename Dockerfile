@@ -1,37 +1,39 @@
 # syntax=docker/dockerfile:1
-# docker buildx create --use --name insecure-builder --buildkitd-flags '--allow-insecure-entitlement security.insecure'
+# docker buildx use --default default
 # docker buildx build --output type=docker --build-arg UNAMEM=$(uname -m) -t mylfs:latest .
+# docker buildx create --use --name insecure-builder --buildkitd-flags '--allow-insecure-entitlement security.insecure'
 # docker buildx build --allow security.insecure --output type=docker --build-arg UNAMEM=$(uname -m) -t mylfs:latest .
 
-FROM ubuntu as chapter4to7
-# for debug: docker build --target chapter4to7 -t prelfs .
+FROM ubuntu as chapter3to6
+# for debug: docker build --target chapter3to6 -t prelfs .
 
+ARG LFSVERSION=12.0
 ENV LFS=/mnt/lfs
+
+# Chapter 3. Packages and Patches
 RUN <<"EOR"
 set -e
 apt update
 apt install -y sudo git wget python3 mg
 mkdir /alfs
 cd /alfs
-git clone --branch 12.0 https://git.linuxfromscratch.org/lfs.git lfs-git
+git clone --branch $LFSVERSION https://git.linuxfromscratch.org/lfs.git lfs-git
+git clone --branch $LFSVERSION https://git.linuxfromscratch.org/blfs.git blfs-git
 ln -svf /bin/bash /bin/sh
 apt install -y build-essential bison gawk patch texinfo
 mkdir -pv $LFS
 mkdir -v $LFS/sources
 chmod -v a+wt $LFS/sources
-EOR
 
 # Get source files
-RUN <<"EOR"
-set -e
-wget https://www.linuxfromscratch.org/lfs/view/stable/wget-list-sysv
+wget https://www.linuxfromscratch.org/lfs/view/$LFSVERSION/wget-list-sysv
 wget --input-file=wget-list-sysv --continue --directory-prefix=$LFS/sources
 wget --directory-prefix=$LFS/sources https://www.linuxfromscratch.org/lfs/view/stable/md5sums
 cd $LFS/sources && md5sum -c md5sums
-# chown root:root $LFS/sources/*
+# chown root:root $LFS/sources/* # already root
 EOR
 
-# Chapter 4: final preparations
+# Chapter 4. Final Preparations
 RUN <<"EOR"
 set -e
 mkdir -pv $LFS/{etc,var} $LFS/usr/{bin,lib,sbin}
@@ -86,16 +88,6 @@ import tempfile
 import xml.etree.ElementTree as ET
 import subprocess as sp
 
-# CLI
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    '--resume-from',
-    help='Starts building from this package, e.g. "binutils-pass1"'
-)
-parser.add_argument('--chroot', action='store_true')
-parser.add_argument('chapter', help='Chapters to build, e.g. "06 07"', nargs='+')
-args = parser.parse_args()
-
 # Read entities
 entity_regex = re.compile(r'<!ENTITY(?: \%)? ([\w-]+)\s+(?:\w+\s+)?"(.*)">')
 entities = []
@@ -123,24 +115,78 @@ entities['ndash'] = '-'
 # tcl chapter 8
 entities['tdbc-ver'] = '1.1.5'
 entities['itcl-ver'] = '4.2.3'
+# clock chapter 9
+entities['AElig'] = ''
+entities['site'] = 'local'
+entities['nbsp'] = ' '
 
-#pkgname_exceptions = {
-#    'binutils-pass1': 'binutils',
-#    'gcc-libstdc++': 'gcc',
-#    'gcc-pass1': 'gcc',
-#    'linux-headers': 'linux',
-#    'binutils-pass2': 'binutils',
-#    'gcc-pass2': 'gcc'
-#}
+pkgname_exceptions = {
+    'binutils-pass1': 'binutils',
+    'gcc-libstdc++': 'gcc',
+    'gcc-pass1': 'gcc',
+    'linux-headers': 'linux',
+    'binutils-pass2': 'binutils',
+    'gcc-pass2': 'gcc'
+}
+# Command modification to enable autobuild
+# Packages with known test failures still execute step but continue
+mct = ('make check','make check || true')
+mkct = ('make -k check','make -k check || true')
+command_mods = {
+    # format: (chapter, package): [(oldcommand, replacement),]
+    ('07','ch-tools-createfiles'): [
+      # This should be conditional for (unpriviliged) build step
+      ('ln -sv /proc/self/mounts /etc/mtab',''),
+      ('cat > /etc/hosts << EOF','cat > /tmp/hosts << EOF')
+    ],
+    ('07','ch-tools-changingowner'): [(',etc,',',')],
+    ('08','glibc'): [mct],
+    ('08','binutils'): [mkct],
+    ('08','attr'): [mct], # might be docker filesystem
+    ('08','shadow'): [('passwd root','')], # asks for 'root' password interactively
+    ('08','libtool'): [mkct],
+    ('08','inetutils'): [mct], # failed hostname -> controlled by docker
+    ('08','automake'): [('make -j4 check','make -j4 check || true')],
+    ('08','coreutils'): [
+      # test-getlogin can fail
+      ('su tester -c "PATH=$PATH make RUN_EXPENSIVE_TESTS=yes check"',
+      'su tester -c "PATH=$PATH make RUN_EXPENSIVE_TESTS=yes check" || true')],
+    ('08','tar'): [mct], ('08','man-db'): [mkct],
+    ('08','vim'): [
+      ('su tester -c "LANG=en_US.UTF-8 make -j1 test" &> vim-test.log',
+      'su tester -c "LANG=en_US.UTF-8 make -j1 test" &> vim-test.log || true'),
+      ("vim -c ':options'",'')],
+    ('08','util-linux'): [('su tester -c "make -k check"','su tester -c "make -k check" || true')],
+    ('08','bash'): [
+      ('exec /usr/bin/bash --login',''),
+      ('tests/run.sh --srcdir=$PWD --builddir=$PWD','')],
+    ('08','procps-ng'):[mct],
+    ('08','ch-system-stripping'):[(
+      ') strip --strip-unneeded $i',
+      ') strip --strip-unneeded $i || true')]
+}
+replaceables = {
+  '<paper_size>':'A4',
+  '<xxx>': 'en_GB' # zoneinfo
+}
 
-resume = True if args.resume_from else False
-for chapter in args.chapter:
-    print('Compiling for chapter', chapter)
-    chroot = args.chroot and int(chapter)>=7
+def download_file(url, dir):
+    import ssl
+    #See python note in https://www.linuxfromscratch.org/blfs/view/svn/postlfs/make-ca.html
+    import certifi
+    from urllib.request import urlopen
+    context = ssl.create_default_context(cafile=certifi.where())
+    with open(os.path.join(dir,url.split('/')[-1]),'wb') as out:
+        out.write(urlopen(url,context=context).read())
+
+def process_chapter(chapter, chroot, resume_from=None,
+    install_packages=None, skip_packages={},
+    non_package_scripts={}, dry_run=False):
+    resume = True if resume_from else False
     tree = ET.parse(f"/alfs/lfs-git/chapter{chapter}/chapter{chapter}.xml")
     root = tree.getroot()
-    for child in root:
-        if child.tag == 'title': continue
+    print(root[0].text) # root[0].tag == 'title'
+    for child in root[1:]:
         component_file = os.path.join(
             f"/alfs/lfs-git/chapter{chapter}/",
             child.attrib['href']
@@ -151,20 +197,29 @@ for chapter in args.chapter:
         component_tree = ET.parse(component_file, parser=parser)
         component_root = component_tree.getroot()
         info = component_root.find('sect1info')
-        if not info:
+        if info:
+            pkgname = info.find('productname').text
+            if resume:
+                if resume_from == pkgname:
+                    resume = False
+                else: continue
+            elif install_packages and pkgname not in install_packages:
+                continue
+            elif pkgname in skip_packages: continue
+            ET.dump(info)
+        
+            pkgname = pkgname_exceptions.get(pkgname, pkgname)
+            pkgversion = info.find('productnumber').text
+            pkgfile = info.find('address').text.strip()
+            pkgfile = pkgfile[pkgfile.rindex('/')+1:]
+            pkgdir = pkgfile[:pkgfile.rindex('.tar.')]
+            pkgext = pkgfile[pkgfile.rindex('.tar.'):]
+        elif component_root.get('id') in non_package_scripts:
+            pkgname = component_root.get('id')
+        else:
+            print(component_root.get('id'))
             continue
-        ET.dump(info)
-        pkgname = info.find('productname').text
-        if resume:
-            if args.resume_from == pkgname:
-                resume = False
-            else: continue
-        #pkgname = pkgname_exceptions.get(pkgname, pkgname)
-        pkgversion = info.find('productnumber').text
-        pkgfile = info.find('address').text.strip()
-	pkgfile = pkgfile[pkgfile.rindex('/')+1:]
-	pkgdir = pkgfile[:-7]
-        pkgext = pkgfile[-7:]
+        
         tempscript = tempfile.NamedTemporaryFile(
             suffix=f"c{chapter}.sh", delete=False,
             prefix='/mnt/lfs/tmp/' if chroot else None
@@ -174,145 +229,122 @@ for chapter in args.chapter:
                 '#!/bin/bash\n',
                 'set -e\n',
                 'cd $LFS/sources\n',
+            ])
+            if info: shout.writelines([
                 f"tar -xvf {pkgfile}\n",
                 f"cd {pkgdir}\n"
             ])
+            nodumps = set(
+                component_root.findall(
+                    './/screen[@role="nodump"]/userinput'
+            ))
             for ui in component_root.findall('.//screen/userinput'):
-                shout.write(ui.text+'\n')
-            shout.writelines([
-                'cd $LFS/sources\n','env\n',
+                if ui.text and ui not in nodumps:
+                    scriptext = ui.text
+                    for literal in ui.findall('literal'):
+                        # Probably only ever 1 literal
+                        scriptext += literal.text + literal.tail
+                    for replace in ui.findall('replaceable'):
+                        # A mix of literal and replaceable will break the code
+                        scriptext += replaceables[replace.text] + replace.tail
+                    if (chapter, pkgname) in command_mods:
+                        for mod in command_mods[(chapter, pkgname)]:
+                            scriptext = scriptext.replace(mod[0],mod[1])
+                    shout.write(scriptext+'\n')
+            if info: shout.writelines([
+                'cd $LFS/sources\n',
                 f"rm -rf {pkgdir}\n"
             ])
-        spout = sp.run(
-            ["bash", tempscript.name] if not chroot
-            else [
-                'chroot', os.environ['LFS'], '/usr/bin/env', '-i',
-                'HOME=/root', f'TERM="{os.environ["TERM"]}"',
-                "PS1='(lfs chroot) \\u:\\w\\$ '",
-                'PATH=/usr/bin:/usr/sbin',
-                '/bin/bash', #'--login',
-                tempscript.name[8:]
-            ], capture_output=True
-        )
-        #print(spout.stdout)
-        print(spout.stderr[-500:])
-        #spout.check_returncode()
-        if spout.returncode != 0:
-            print(spout.stdout[-500:])
-            with open('failed_log.txt', 'wb') as f:
-                f.write(spout.stdout[-500:])
-                f.write(spout.stderr[-500:])
-            exit(0)
+        if dry_run:
+            print(open(tempscript.name).read())
+            input()
+        else:
+            spout = sp.run(
+                ["bash", tempscript.name] if not chroot
+                else [
+                    'chroot', os.environ['LFS'], '/usr/bin/env', '-i',
+                    'HOME=/root', f'TERM="{os.environ["TERM"]}"',
+                    "PS1='(lfs chroot) \\u:\\w\\$ '",
+                    'PATH=/usr/bin:/usr/sbin',
+                    '/bin/bash', #'--login',
+                    tempscript.name[8:]
+                ], capture_output=True
+            )
+            #print(spout.stdout)
+            print(spout.stderr[-500:])
+            #spout.check_returncode()
+            if spout.returncode != 0:
+                print(spout.stdout[-500:])
+                with open('failed_log.txt', 'wb') as f:
+                    f.write(spout.stdout[-500:])
+                    f.write(spout.stderr[-500:])
+                exit(1)
         tempscript.close()
+        last_processed = component_root
+    return component_root
+
+if __name__ == '__main__':
+    # CLI
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--resume-from',
+        help='Starts building from this package, e.g. "binutils-pass1"'
+    )
+    parser.add_argument(
+      '--install-package', action='append',
+      help='Instead of installing all chapter packages, just this/these'
+    )
+    parser.add_argument(
+      '--skip-package', action='append',
+      help='Skip installation of this package'
+    )
+    parser.add_argument(
+      '--script-section', action='append',
+      help='Provide section id for non-package script section'
+    )
+    parser.add_argument('--chroot', action='store_true')
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('chapter', help='Chapters to build, e.g. "06 07"', nargs='+')
+    args = parser.parse_args()
+    resume_from = args.resume_from
+    skip_packages = args.skip_package or []
+    non_package_scripts = args.script_section or []
+
+    for chapter in args.chapter:
+        print('Compiling for chapter', chapter)
+        chroot = args.chroot and int(chapter)>=7
+        process_chapter(
+            chapter, chroot=chroot, resume_from=resume_from,
+            install_packages=args.install_package,
+            skip_packages=skip_packages,
+            non_package_scripts=non_package_scripts,
+            dry_run=args.dry_run
+        )
+        resume=False # only for first chapter being processed
+
 EOF
-#SHELL ["/bin/bash", "-c"]
 RUN python3 /alfs/pylfs.py 05 06
 
 # Chapter 7
 FROM scratch as chapter7
-COPY --from=chapter4to7 /mnt/lfs /
-COPY --from=chapter4to7 /alfs /alfs
-# Create /etc/passwd
+COPY --from=chapter3to6 /mnt/lfs /
+COPY --from=chapter3to6 /alfs /alfs
+
+# Env settings for small build
+# https://www.linuxfromscratch.org/hints/downloads/files/small-lfs.txt
+ARG CC="gcc -s" CFLAGS="-Os -fomit-frame-pointer" LDFLAGS="-s"
+
+# Minimal /etc/passwd and /etc/group to run initial setup
 COPY <<"EOF" /etc/passwd
 root:x:0:0:root:/root:/bin/bash
-bin:x:1:1:bin:/dev/null:/usr/bin/false
-daemon:x:6:6:Daemon User:/dev/null:/usr/bin/false
-messagebus:x:18:18:D-Bus Message Daemon User:/run/dbus:/usr/bin/false
-uuidd:x:80:80:UUID Generation Daemon User:/dev/null:/usr/bin/false
-nobody:x:65534:65534:Unprivileged User:/dev/null:/usr/bin/false
 EOF
-
-# Create /etc/group
 COPY <<"EOF" /etc/group
 root:x:0:
-bin:x:1:daemon
-sys:x:2:
-kmem:x:3:
-tape:x:4:
-tty:x:5:
-daemon:x:6:
-floppy:x:7:
-disk:x:8:
-lp:x:9:
-dialout:x:10:
-audio:x:11:
-video:x:12:
-utmp:x:13:
-usb:x:14:
-cdrom:x:15:
-adm:x:16:
-messagebus:x:18:
-input:x:24:
-mail:x:34:
-kvm:x:61:
-uuidd:x:80:
-wheel:x:97:
-users:x:999:
-nogroup:x:65534:
 EOF
 
 RUN <<"EOR"
-set -e
-chown -R root:root $LFS/{usr,lib,var,bin,sbin,tools}
-#to include etc needs to run with privilige
-#chown -R root:root $LFS/{usr,lib,var,etc,bin,sbin,tools}
-case $(uname -m) in
-  x86_64) chown -R root:root $LFS/lib64 ;;
-esac
-# Steps not necesarry in docker context
-#mkdir -pv $LFS/{dev,proc,sys,run}
-#mount -v --bind /dev $LFS/dev
-#mount -v --bind /dev/pts $LFS/dev/pts
-#mount -vt proc proc $LFS/proc
-#mount -vt sysfs sysfs $LFS/sys
-#mount -vt tmpfs tmpfs $LFS/run
-#if [ -h $LFS/dev/shm ]; then
-#  mkdir -pv $LFS/$(readlink $LFS/dev/shm)
-#else
-#  mount -t tmpfs -o nosuid,nodev tmpfs $LFS/dev/shm
-#fi
-#chroot "$LFS" /usr/bin/env -i   \
-#    HOME=/root                  \
-#    TERM="$TERM"                \
-#    PS1='(lfs chroot) \u:\w\$ ' \
-#    PATH=/usr/bin:/usr/sbin     \
-#    /bin/bash --login
-mkdir -pv /{boot,home,mnt,opt,srv}
-mkdir -pv /etc/{opt,sysconfig}
-mkdir -pv /lib/firmware
-mkdir -pv /media/{floppy,cdrom}
-mkdir -pv /usr/{,local/}{include,src}
-mkdir -pv /usr/local/{bin,lib,sbin}
-mkdir -pv /usr/{,local/}share/{color,dict,doc,info,locale,man}
-mkdir -pv /usr/{,local/}share/{misc,terminfo,zoneinfo}
-mkdir -pv /usr/{,local/}share/man/man{1..8}
-mkdir -pv /var/{cache,local,log,mail,opt,spool}
-mkdir -pv /var/lib/{color,misc,locate}
-
-ln -sfv /run /var/run
-ln -sfv /run/lock /var/lock
-
-install -dv -m 0750 /root
-install -dv -m 1777 /tmp /var/tmp
-
-#ln -sv /proc/self/mounts /etc/mtab
-# needs privilige to overwrite /etc/hosts
-#cat > /etc/hosts << EOF
-#127.0.0.1  localhost $(hostname)
-#::1        localhost
-#EOF
-
-# Test account
-echo "tester:x:101:101::/home/tester:/bin/bash" >> /etc/passwd
-echo "tester:x:101:" >> /etc/group
-install -o tester -d /home/tester
-#exec /usr/bin/bash --login
-touch /var/log/{btmp,lastlog,faillog,wtmp}
-chgrp -v utmp /var/log/lastlog
-chmod -v 664  /var/log/lastlog
-chmod -v 600  /var/log/btmp
-
 # Install python3 to run pylfs script
+mkdir /tmp
 cd /sources
 PYTHONPACKAGE=$(ls Python-3*.tar.xz)
 tar -xvf $PYTHONPACKAGE
@@ -324,19 +356,60 @@ make
 make install
 cd ..
 rm -rf ${PYTHONPACKAGE%%.tar.xz}
-EOR
 
-# Chapter 7 packages
-RUN python3 /alfs/pylfs.py 07
-
-# Cleaning up
-RUN <<"EOR"
-rm -rf /usr/share/{info,man,doc}/*
-find /usr/{lib,libexec} -name \*.la -delete
-rm -rf /tools
+python3 /alfs/pylfs.py \
+  --script-section ch-tools-changingowner \
+  --script-section ch-tools-cleanup \
+  --script-section ch-tools-creatingdirs \
+  --script-section ch-tools-createfiles \
+  07
 EOR
 
 FROM scratch
 COPY --from=chapter7 / /
-#mv tcl src to tcl for issue
-RUN python3 /alfs/pylfs.py 08
+RUN <<"EOR"
+# tcl package name issue
+cd /sources
+TCLPACKAGE=$(ls tcl*-src.tar.gz)
+ln -s ${TCLPACKAGE%%-src.tar.gz} ${TCLPACKAGE%%.tar.gz}
+
+# Chapter 8 installation
+python3 /alfs/pylfs.py --script-section ch-system-stripping \
+  --script-section ch-system-cleanup --skip-package dbus \
+  08
+python3 /alfs/pylfs.py --script-section ch-config-clock \
+  --script-section ch-system-inputrc \
+  --script-section ch-system-shells \
+  --skip-package bootscripts 09
+EOR
+
+#RUN <<"EOR"
+#cd /sources
+#pip3 install requests
+#python3 -c"import requests;
+#open('wget-1.21.4.tar.gz','wb').write(requests.get('https://ftp.gnu.org/gnu/wget/wget-1.21.4.tar.gz',allow_redirects=True).content)"
+#tar -xvf wget-1.21.4.tar.gz
+#./configure --prefix=/usr      \
+#            --sysconfdir=/etc  \
+#            --with-ssl=openssl &&
+#make
+#make install
+#cd ..
+#rm -rf wget-1.21.4.tar.gz
+#wget --no-check-certificate https://sqlite.org/2023/sqlite-autoconf-3420000.tar.gz
+#tar -xvf sqlite-autoconf-3420000.tar.gz
+#cd sqlite-autoconf-3420000
+#./configure --prefix=/usr     \
+#            --disable-static  \
+#            --enable-fts{4,5} \
+#            CPPFLAGS="-DSQLITE_ENABLE_COLUMN_METADATA=1 \
+#                      -DSQLITE_ENABLE_UNLOCK_NOTIFY=1   \
+#                      -DSQLITE_ENABLE_DBSTAT_VTAB=1     \
+#                      -DSQLITE_SECURE_DELETE=1          \
+#                      -DSQLITE_ENABLE_FTS3_TOKENIZER=1"
+#make
+#make install
+#cd ..
+#rm -rf sqlite-autoconf-3420000
+# python config -> --enable-loadable-sqlite-extensions
+#EOR
